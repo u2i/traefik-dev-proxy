@@ -25,9 +25,11 @@ traefik-dev-proxy uninstall   # Remove completely
 
 ## Access Your Apps
 
-- **HTTP**: `http://app.localhost:8080`
-- **HTTPS**: `https://app.localhost:8443`
-- **Wildcards**: `https://api.app.localhost:8443`
+- **HTTP**: `http://app.local.test:8080`
+- **HTTPS**: `https://app.local.test:8443`
+- **Wildcards**: `https://api.app.local.test:8443`
+
+**Note**: We use `.local.test` instead of `.localhost` because browsers don't support wildcard certificates for `*.localhost`.
 
 ## App Configuration
 
@@ -55,7 +57,7 @@ networks:
 In `.env.dev`:
 ```
 COMPOSE_PROJECT_NAME=myapp
-APP_HOSTNAME=myapp.localhost
+APP_HOSTNAME=myapp.local.test
 ```
 
 ## Features

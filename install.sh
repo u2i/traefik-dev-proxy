@@ -67,8 +67,9 @@ docker network create devnet 2>/dev/null || echo "✓ Network already exists"
 # Generate SSL certificates
 echo "🔒 Generating SSL certificates..."
 cd "$DATA_DIR/certs"
-if [[ ! -f _wildcard.localhost+3.pem ]]; then
-    mkcert "*.localhost" localhost 127.0.0.1 ::1
+if [[ ! -f _wildcard.local.test+4.pem ]]; then
+    # Use .local.test instead of .localhost - browsers don't support *.localhost wildcards
+    mkcert "*.local.test" "local.test" localhost 127.0.0.1 ::1
 else
     echo "✓ Certificates already exist"
 fi
@@ -78,8 +79,8 @@ echo "📝 Creating Traefik dynamic configuration..."
 cat > "$DATA_DIR/config/dynamic.yml" << 'EOF'
 tls:
   certificates:
-    - certFile: /etc/traefik/certs/_wildcard.localhost+3.pem
-      keyFile: /etc/traefik/certs/_wildcard.localhost+3-key.pem
+    - certFile: /etc/traefik/certs/_wildcard.local.test+4.pem
+      keyFile: /etc/traefik/certs/_wildcard.local.test+4-key.pem
 EOF
 
 # Create compose.yml
