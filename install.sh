@@ -33,10 +33,25 @@ fi
 
 # Install local CA
 echo "🔐 Installing local CA (may require password)..."
-if ! mkcert -CAROOT >/dev/null 2>&1 || ! sudo -n true 2>/dev/null; then
-    sudo mkcert -install
+# Always run as user - mkcert will prompt for sudo when needed
+# This ensures CA files are owned by the user, not root
+if ! mkcert -CAROOT >/dev/null 2>&1; then
+    # CA doesn't exist, install it
+    mkcert -install
 else
-    mkcert -install 2>/dev/null || sudo mkcert -install
+    # CA exists, check if it's installed in system trust store
+    # mkcert -install is idempotent and safe to run multiple times
+    mkcert -install
+fi
+
+# Verify CA permissions (should be owned by user, not root)
+CA_ROOT="$(mkcert -CAROOT)"
+if [[ ! -r "$CA_ROOT/rootCA-key.pem" ]]; then
+    echo "⚠️  CA key file is not readable. This usually means it was created with sudo."
+    echo "Fixing permissions..."
+    sudo chown -R "$(whoami)" "$CA_ROOT"
+    chmod 600 "$CA_ROOT/rootCA-key.pem"
+    chmod 644 "$CA_ROOT/rootCA.pem"
 fi
 
 # Create directories
