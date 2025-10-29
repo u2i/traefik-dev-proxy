@@ -25,11 +25,11 @@ traefik-dev-proxy uninstall   # Remove completely
 
 ## Access Your Apps
 
-- `http://app.localhost`
-- `http://api.app.localhost` (wildcards work!)
-- `http://admin.app.localhost`
+- `http://app.localhost:8080`
+- `http://api.app.localhost:8080` (wildcards work!)
+- `http://admin.app.localhost:8080`
 
-**Note**: HTTP-only (no HTTPS) because browsers don't support wildcard `*.localhost` certificates. For 99% of local dev, HTTP is fine.
+**Note**: HTTP-only (no HTTPS) because browsers don't support wildcard `*.localhost` certificates. Port 8080 is used to avoid needing privileged access for port 80.
 
 ## App Configuration
 
@@ -72,14 +72,14 @@ APP_HOSTNAME=myapp.localhost
 
 ## Troubleshooting
 
-### Port 80 already in use
+### Port 8080 already in use
 
-If port 80 is taken, you can use a different port:
+If port 8080 is taken, you can use a different port:
 ```bash
-DEV_PROXY_PORT=8080 traefik-dev-proxy start
+DEV_PROXY_PORT=9090 traefik-dev-proxy start
 ```
 
-Then access apps at `http://app.localhost:8080`
+Then access apps at `http://app.localhost:9090`
 
 ### 404 Not Found
 

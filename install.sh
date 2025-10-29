@@ -40,7 +40,7 @@ services:
       - --providers.docker.exposedbydefault=false
       - --entryPoints.web.address=:80
     ports:
-      - "${DEV_PROXY_PORT-80}:80"
+      - "${DEV_PROXY_PORT-8080}:80"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks: [devnet]
@@ -63,7 +63,7 @@ COMPOSE_FILE="$DATA_DIR/config/compose.yml"
 cmd_start() {
     echo "🚀 Starting Traefik proxy..."
     export DATA_DIR
-    export DEV_PROXY_PORT=${DEV_PROXY_PORT:-80}
+    export DEV_PROXY_PORT=${DEV_PROXY_PORT:-8080}
     docker compose -f "$COMPOSE_FILE" up -d
     echo "✅ Traefik proxy started on:"
     echo "   HTTP: http://localhost:${DEV_PROXY_PORT}"
@@ -107,7 +107,7 @@ Commands:
   help        Show this help
 
 Environment variables:
-  DEV_PROXY_PORT      HTTP port (default: 80)
+  DEV_PROXY_PORT      HTTP port (default: 8080)
 
 Examples:
   traefik-dev-proxy start
@@ -197,5 +197,5 @@ echo "  traefik-dev-proxy logs        - Show proxy logs"
 echo "  traefik-dev-proxy uninstall   - Remove installation"
 echo
 echo "Your apps will be accessible at:"
-echo "  http://<app>.localhost"
+echo "  http://<app>.localhost:8080"
 echo
