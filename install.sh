@@ -17,71 +17,17 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-# Check if mkcert is installed
-if ! command -v mkcert >/dev/null 2>&1; then
-    echo "📦 Installing mkcert..."
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        brew install mkcert
-    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        echo "Please install mkcert manually: https://github.com/FiloSottile/mkcert#installation"
-        exit 1
-    else
-        echo "Unsupported OS. Please install mkcert manually."
-        exit 1
-    fi
-fi
-
-# Install local CA
-echo "🔐 Installing local CA (may require password)..."
-# Always run as user - mkcert will prompt for sudo when needed
-# This ensures CA files are owned by the user, not root
-if ! mkcert -CAROOT >/dev/null 2>&1; then
-    # CA doesn't exist, install it
-    mkcert -install
-else
-    # CA exists, check if it's installed in system trust store
-    # mkcert -install is idempotent and safe to run multiple times
-    mkcert -install
-fi
-
-# Verify CA permissions (should be owned by user, not root)
-CA_ROOT="$(mkcert -CAROOT)"
-if [[ ! -r "$CA_ROOT/rootCA-key.pem" ]]; then
-    echo "⚠️  CA key file is not readable. This usually means it was created with sudo."
-    echo "Fixing permissions..."
-    sudo chown -R "$(whoami)" "$CA_ROOT"
-    chmod 600 "$CA_ROOT/rootCA-key.pem"
-    chmod 644 "$CA_ROOT/rootCA.pem"
-fi
+# Note: We don't use HTTPS because browsers don't support wildcard *.localhost certificates
+# HTTP on port 80 works fine for local development
 
 # Create directories
 echo "📁 Creating directories..."
 mkdir -p "$BIN_DIR"
-mkdir -p "$DATA_DIR/certs"
 mkdir -p "$DATA_DIR/config"
 
 # Create Docker network
 echo "🌐 Creating Docker network 'devnet'..."
 docker network create devnet 2>/dev/null || echo "✓ Network already exists"
-
-# Generate SSL certificates
-echo "🔒 Generating SSL certificates..."
-cd "$DATA_DIR/certs"
-if [[ ! -f _wildcard.local.test+4.pem ]]; then
-    # Use .local.test instead of .localhost - browsers don't support *.localhost wildcards
-    mkcert "*.local.test" "local.test" localhost 127.0.0.1 ::1
-else
-    echo "✓ Certificates already exist"
-fi
-
-# Create dynamic.yml
-echo "📝 Creating Traefik dynamic configuration..."
-cat > "$DATA_DIR/config/dynamic.yml" << 'EOF'
-tls:
-  certificates:
-    - certFile: /etc/traefik/certs/_wildcard.local.test+4.pem
-      keyFile: /etc/traefik/certs/_wildcard.local.test+4-key.pem
-EOF
 
 # Create compose.yml
 echo "📝 Creating Traefik compose configuration..."
@@ -92,16 +38,11 @@ services:
     command:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
-      - --entryPoints.web.address=:8080
-      - --entryPoints.websecure.address=:8443
-      - --providers.file.directory=/etc/traefik/dynamic
+      - --entryPoints.web.address=:80
     ports:
-      - "127.0.0.1:${DEV_PROXY_PORT-8080}:8080"
-      - "127.0.0.1:${DEV_PROXY_TLS_PORT-8443}:8443"
+      - "${DEV_PROXY_PORT-80}:80"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${DATA_DIR}/certs:/etc/traefik/certs:ro
-      - ${DATA_DIR}/config/dynamic.yml:/etc/traefik/dynamic/dynamic.yml:ro
     networks: [devnet]
     restart: unless-stopped
 
@@ -122,11 +63,10 @@ COMPOSE_FILE="$DATA_DIR/config/compose.yml"
 cmd_start() {
     echo "🚀 Starting Traefik proxy..."
     export DATA_DIR
-    export DEV_PROXY_PORT=${DEV_PROXY_PORT:-8080}
+    export DEV_PROXY_PORT=${DEV_PROXY_PORT:-80}
     docker compose -f "$COMPOSE_FILE" up -d
     echo "✅ Traefik proxy started on:"
-    echo "   HTTP:  http://localhost:8080"
-    echo "   HTTPS: https://localhost:8443"
+    echo "   HTTP: http://localhost:${DEV_PROXY_PORT}"
 }
 
 cmd_stop() {
@@ -167,12 +107,11 @@ Commands:
   help        Show this help
 
 Environment variables:
-  DEV_PROXY_PORT      HTTP port (default: 8080)
-  DEV_PROXY_TLS_PORT  HTTPS port (default: 8443)
+  DEV_PROXY_PORT      HTTP port (default: 80)
 
 Examples:
   traefik-dev-proxy start
-  DEV_PROXY_PORT=9090 traefik-dev-proxy start
+  DEV_PROXY_PORT=8080 traefik-dev-proxy start
   traefik-dev-proxy logs
 EOF
 }
@@ -194,8 +133,6 @@ cmd_uninstall() {
     rm -f "$HOME/.local/bin/traefik-dev-proxy"
 
     echo "✅ Uninstalled successfully"
-    echo "Note: mkcert and its CA are still installed. To remove:"
-    echo "  mkcert -uninstall"
 }
 
 case "${1:-help}" in
@@ -260,6 +197,5 @@ echo "  traefik-dev-proxy logs        - Show proxy logs"
 echo "  traefik-dev-proxy uninstall   - Remove installation"
 echo
 echo "Your apps will be accessible at:"
-echo "  HTTP:  http://<app>.localhost:8080"
-echo "  HTTPS: https://<app>.localhost:8443"
+echo "  http://<app>.localhost"
 echo

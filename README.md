@@ -10,7 +10,7 @@ curl -sSL https://raw.githubusercontent.com/u2i/traefik-dev-proxy/main/install.s
 
 This installs:
 - Executable: `~/.local/bin/traefik-dev-proxy`
-- Data/certs: `~/.local/share/traefik-dev-proxy`
+- Config: `~/.local/share/traefik-dev-proxy`
 - Docker network: `devnet`
 
 ## Usage
@@ -25,11 +25,11 @@ traefik-dev-proxy uninstall   # Remove completely
 
 ## Access Your Apps
 
-- **HTTP**: `http://app.local.test:8080`
-- **HTTPS**: `https://app.local.test:8443`
-- **Wildcards**: `https://api.app.local.test:8443`
+- `http://app.localhost`
+- `http://api.app.localhost` (wildcards work!)
+- `http://admin.app.localhost`
 
-**Note**: We use `.local.test` instead of `.localhost` because browsers don't support wildcard certificates for `*.localhost`.
+**Note**: HTTP-only (no HTTPS) because browsers don't support wildcard `*.localhost` certificates. For 99% of local dev, HTTP is fine.
 
 ## App Configuration
 
@@ -44,9 +44,6 @@ services:
       - "traefik.docker.network=devnet"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}.rule=Host(\`${APP_HOSTNAME}\`) || HostRegexp(\`{subdomain:[a-zA-Z0-9-]+}.${APP_HOSTNAME}\`)"
       - "traefik.http.routers.${COMPOSE_PROJECT_NAME}.entrypoints=web"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.rule=Host(\`${APP_HOSTNAME}\`) || HostRegexp(\`{subdomain:[a-zA-Z0-9-]+}.${APP_HOSTNAME}\`)"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.entrypoints=websecure"
-      - "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.tls=true"
       - "traefik.http.services.${COMPOSE_PROJECT_NAME}.loadbalancer.server.port=4000"
 
 networks:
@@ -57,52 +54,36 @@ networks:
 In `.env.dev`:
 ```
 COMPOSE_PROJECT_NAME=myapp
-APP_HOSTNAME=myapp.local.test
+APP_HOSTNAME=myapp.localhost
 ```
 
 ## Features
 
 ✅ Single command install
-✅ SSL with trusted certificates (no browser warnings)
 ✅ Wildcard subdomain support
 ✅ No port conflicts between apps
+✅ Auto-resolving `.localhost` domains
 ✅ Clean uninstall
 
 ## Requirements
 
 - Docker
 - macOS or Linux
-- Homebrew (macOS) for automatic mkcert install
 
 ## Troubleshooting
 
-### Permission denied error with mkcert
+### Port 80 already in use
 
-If you see: `ERROR: failed to read the CA key: open .../rootCA-key.pem: permission denied`
-
-Fix permissions:
+If port 80 is taken, you can use a different port:
 ```bash
-sudo chown -R $(whoami) "$(mkcert -CAROOT)"
-chmod 600 "$(mkcert -CAROOT)/rootCA-key.pem"
-chmod 644 "$(mkcert -CAROOT)/rootCA.pem"
+DEV_PROXY_PORT=8080 traefik-dev-proxy start
 ```
 
-Or regenerate the CA:
-```bash
-mkcert -uninstall
-rm -rf "$(mkcert -CAROOT)"
-mkcert -install
-```
+Then access apps at `http://app.localhost:8080`
 
-### HTTPS shows "Not Secure" / Certificate error
+### 404 Not Found
 
-Completely quit and restart your browser after installation. Browsers need to be restarted to pick up the new trusted CA.
-
-### 404 on HTTPS but HTTP works
-
-Your app needs HTTPS router labels. Add these to your docker-compose.yml:
-```yaml
-- "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.rule=Host(\`${APP_HOSTNAME}\`) || HostRegexp(\`{subdomain:[a-zA-Z0-9-]+}.${APP_HOSTNAME}\`)"
-- "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.entrypoints=websecure"
-- "traefik.http.routers.${COMPOSE_PROJECT_NAME}-tls.tls=true"
-```
+Check that:
+1. Your app is running and on the `devnet` network
+2. The Traefik labels are correct in your docker-compose.yml
+3. `APP_HOSTNAME` matches what you're accessing (e.g., `myapp.localhost`)
