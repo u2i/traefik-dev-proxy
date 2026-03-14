@@ -39,6 +39,8 @@ services:
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
       - --entryPoints.web.address=:80
+      - --experimental.plugins.rewriteheaders.modulename=github.com/XciD/traefik-plugin-rewrite-headers
+      - --experimental.plugins.rewriteheaders.version=v0.0.4
     ports:
       - "${DEV_PROXY_PORT-8080}:80"
     volumes:
