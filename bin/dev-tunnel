@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cloudflare Tunnel + Traefik reverse proxy manager for dev environments.
+#
+# Usage:
+#   dev-tunnel setup <user> [project]    # One-time: create tunnel, DNS, SSL, save token
+#   dev-tunnel start [tunnel-name]       # Start tunnel (reads token from 1Password)
+#   dev-tunnel stop  [tunnel-name]       # Stop tunnel
+#   dev-tunnel status [tunnel-name]      # Check tunnel status
+#   dev-tunnel proxy <start|stop|restart|status|logs>
+#   dev-tunnel up    [tunnel-name]       # proxy start + tunnel start
+#   dev-tunnel down  [tunnel-name]       # tunnel stop + proxy stop
+#   dev-tunnel uninstall                 # Remove proxy install (does NOT touch CF/1P)
+#
+# The tunnel-name defaults to <dirname>-<user>, e.g. "teamology-tom".
+# The project defaults to the current directory name.
+
+CF_ZONE_ID="c4e31868ea7757dfe1774a94df313e2c"
+CF_ACCOUNT_ID="644fb9a0136cacb4cc8e07fb0468c554"
+CF_API="https://api.cloudflare.com/client/v4"
+OP_CF_TOKEN_ITEM="h2jehlczm27r3zqpse2ip4t6ny"
+
+PROXY_DATA_DIR="$HOME/.local/share/traefik-dev-proxy"
+PROXY_COMPOSE_FILE="$PROXY_DATA_DIR/config/compose.yml"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+cf_api() {
+  local method="$1" endpoint="$2" data="${3:-}"
+  local args=(-s -H "Authorization: Bearer $CF_TOKEN" -H "Content-Type: application/json")
+  [ -n "$data" ] && args+=(-X "$method" -d "$data") || args+=(-X "$method")
+  curl "${args[@]}" "${CF_API}${endpoint}"
+}
+
+upsert_dns() {
+  local name="$1" content="$2"
+  local existing_dns
+  existing_dns=$(cf_api GET "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${name}")
+  if [ "$(echo "$existing_dns" | jq '.result | length')" -gt 0 ]; then
+    local dns_id
+    dns_id=$(echo "$existing_dns" | jq -r '.result[0].id')
+    cf_api PUT "/zones/${CF_ZONE_ID}/dns_records/${dns_id}" \
+      "{\"type\":\"CNAME\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":1,\"proxied\":true}" | jq -r '.success'
+  else
+    cf_api POST "/zones/${CF_ZONE_ID}/dns_records" \
+      "{\"type\":\"CNAME\",\"name\":\"${name}\",\"content\":\"${content}\",\"ttl\":1,\"proxied\":true}" | jq -r '.success'
+  fi
+}
+
+detect_traefik_port() {
+  local port
+  port=$(docker ps --filter "ancestor=traefik:v3" --format '{{.Ports}}' 2>/dev/null \
+    | grep -oE '0\.0\.0\.0:[0-9]+->80' | head -1 | grep -oE ':[0-9]+' | tr -d ':')
+  [ -z "$port" ] && port=$(docker ps --filter "name=traefik" --format '{{.Ports}}' 2>/dev/null \
+    | grep -oE '0\.0\.0\.0:[0-9]+->80' | head -1 | grep -oE ':[0-9]+' | tr -d ':')
+  echo "${port:-8080}"
+}
+
+default_tunnel_name() {
+  echo "$(basename "$(pwd)")-$(whoami)"
+}
+
+# ── Tunnel commands ──────────────────────────────────────────
+
+cmd_setup() {
+  local user="${1:?Usage: dev-tunnel setup <user> [project]}"
+  local project="${2:-$(basename "$(pwd)")}"
+  local tunnel_name="${project}-${user}"
+  local bare_hostname="${project}.${user}.u2i.me"
+  local wildcard_hostname="*.${project}.${user}.u2i.me"
+
+  for cmd in op curl jq cloudflared; do
+    command -v "$cmd" >/dev/null || { echo "ERROR: $cmd not found" >&2; exit 1; }
+  done
+
+  echo "Reading Cloudflare API token from 1Password..."
+  CF_TOKEN=$(op item get "$OP_CF_TOKEN_ITEM" --fields credential --reveal)
+
+  # --- Tunnel ---
+  echo "Checking for existing tunnel '${tunnel_name}'..."
+  local existing existing_count
+  existing=$(cf_api GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?name=${tunnel_name}&is_deleted=false")
+  existing_count=$(echo "$existing" | jq '.result | length')
+
+  local tunnel_id tunnel_token=""
+  if [ "$existing_count" -gt 0 ]; then
+    tunnel_id=$(echo "$existing" | jq -r '.result[0].id')
+    echo "Tunnel '${tunnel_name}' already exists (${tunnel_id}), re-using."
+    tunnel_token=$(cf_api GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/token" | jq -r '.result')
+  else
+    echo "Creating tunnel '${tunnel_name}'..."
+    local result
+    result=$(cf_api POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+      "{\"name\":\"${tunnel_name}\",\"config_src\":\"cloudflare\",\"tunnel_secret\":\"$(openssl rand -base64 32)\"}")
+    [ "$(echo "$result" | jq -r '.success')" != "true" ] && { echo "$result" | jq '.errors' >&2; exit 1; }
+    tunnel_id=$(echo "$result" | jq -r '.result.id')
+    tunnel_token=$(echo "$result" | jq -r '.result.token // empty')
+    echo "Created tunnel: ${tunnel_id}"
+  fi
+
+  local tunnel_target="${tunnel_id}.cfargotunnel.com"
+
+  # --- DNS (both bare and wildcard) ---
+  echo "Creating DNS records..."
+  echo "  ${bare_hostname} -> ${tunnel_target}"
+  upsert_dns "${bare_hostname}" "${tunnel_target}"
+  echo "  ${wildcard_hostname} -> ${tunnel_target}"
+  upsert_dns "${wildcard_hostname}" "${tunnel_target}"
+
+  # --- SSL (cert covering both bare and wildcard) ---
+  local existing_certs cert_count
+  existing_certs=$(cf_api GET "/zones/${CF_ZONE_ID}/ssl/certificate_packs?hosts=${bare_hostname}")
+  cert_count=$(echo "$existing_certs" | jq '[.result[] | select(.type == "advanced") | select(.hosts[] == "'"${bare_hostname}"'" or .hosts[] == "'"${wildcard_hostname}"'")] | length')
+  if [ "$cert_count" -eq 0 ]; then
+    echo "Ordering SSL certificate for ${bare_hostname} + ${wildcard_hostname}..."
+    local result
+    result=$(cf_api POST "/zones/${CF_ZONE_ID}/ssl/certificate_packs/order" \
+      "{\"type\":\"advanced\",\"hosts\":[\"${bare_hostname}\",\"${wildcard_hostname}\"],\"validation_method\":\"txt\",\"validity_days\":90,\"certificate_authority\":\"lets_encrypt\"}")
+    if [ "$(echo "$result" | jq -r '.success')" = "true" ]; then
+      local cert_pack_id
+      cert_pack_id=$(echo "$result" | jq -r '.result.id')
+      sleep 3
+      local cert_details
+      cert_details=$(cf_api GET "/zones/${CF_ZONE_ID}/ssl/certificate_packs/${cert_pack_id}")
+      # Create all validation TXT records
+      local num_records
+      num_records=$(echo "$cert_details" | jq '.result.validation_records | length')
+      for i in $(seq 0 $((num_records - 1))); do
+        local txt_name txt_value
+        txt_name=$(echo "$cert_details" | jq -r ".result.validation_records[$i].txt_name // empty")
+        txt_value=$(echo "$cert_details" | jq -r ".result.validation_records[$i].txt_value // empty")
+        if [ -n "$txt_name" ] && [ -n "$txt_value" ]; then
+          cf_api POST "/zones/${CF_ZONE_ID}/dns_records" \
+            "{\"type\":\"TXT\",\"name\":\"${txt_name}\",\"content\":\"${txt_value}\",\"ttl\":1}" >/dev/null
+        fi
+      done
+      echo "Certificate ordered. Will be issued in 1-5 min."
+    fi
+  else
+    echo "SSL certificate already exists."
+  fi
+
+  # --- Ingress (both bare and wildcard) ---
+  local traefik_port
+  traefik_port=$(detect_traefik_port)
+  echo "Configuring ingress -> http://localhost:${traefik_port}..."
+  cf_api PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/configurations" \
+    "{\"config\":{\"ingress\":[{\"hostname\":\"${wildcard_hostname}\",\"service\":\"http://localhost:${traefik_port}\",\"originRequest\":{}},{\"hostname\":\"${bare_hostname}\",\"service\":\"http://localhost:${traefik_port}\",\"originRequest\":{}},{\"service\":\"http_status:404\"}]}}" >/dev/null
+
+  # --- Save token ---
+  if [ -n "${tunnel_token:-}" ]; then
+    local op_title="Cloudflare Tunnel Token (${tunnel_name})"
+    local op_id
+    op_id=$(op item list --vault Employee 2>/dev/null | grep -F "$op_title" | awk '{print $1}')
+    if [ -n "$op_id" ]; then
+      op item edit "$op_id" "credential=${tunnel_token}" >/dev/null || echo "WARNING: Failed to update token in 1Password" >&2
+    else
+      op item create --category=apiCredential --title="$op_title" --vault=Employee \
+        "credential=${tunnel_token}" >/dev/null || echo "WARNING: Failed to save token to 1Password" >&2
+    fi
+    echo "Token saved to 1Password."
+  fi
+
+  echo ""
+  echo "=== Setup complete ==="
+  echo "Tunnel: ${tunnel_name} (${tunnel_id})"
+  echo "Access: https://${bare_hostname}"
+  echo "        https://<service>.${bare_hostname}"
+  echo "Start:  dev-tunnel start ${tunnel_name}"
+}
+
+cmd_start() {
+  local tunnel_name="${1:-$(default_tunnel_name)}"
+  local pidfile="/tmp/cloudflared-${tunnel_name}.pid"
+  local logfile="/tmp/cloudflared-${tunnel_name}.log"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    echo "Tunnel '${tunnel_name}' already running (PID $(cat "$pidfile"))"
+    exit 0
+  fi
+
+  for cmd in op cloudflared; do
+    command -v "$cmd" >/dev/null || { echo "ERROR: $cmd not found" >&2; exit 1; }
+  done
+
+  local token
+  token=$(op item get "Cloudflare Tunnel Token (${tunnel_name})" --fields credential --reveal --vault Employee 2>/dev/null) || {
+    echo "ERROR: Token not found in 1Password. Run 'dev-tunnel setup <user>' first." >&2; exit 1
+  }
+
+  echo "Starting tunnel '${tunnel_name}'..."
+  nohup cloudflared tunnel run --token "$token" > "$logfile" 2>&1 &
+  echo $! > "$pidfile"
+
+  sleep 2
+  if kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    echo "Tunnel '${tunnel_name}' started (PID $(cat "$pidfile")), log: ${logfile}"
+  else
+    echo "ERROR: Tunnel exited. Check ${logfile}" >&2
+    tail -5 "$logfile" >&2
+    rm -f "$pidfile"
+    exit 1
+  fi
+}
+
+cmd_stop() {
+  local tunnel_name="${1:-$(default_tunnel_name)}"
+  local pidfile="/tmp/cloudflared-${tunnel_name}.pid"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    kill "$(cat "$pidfile")"
+    rm -f "$pidfile"
+    echo "Tunnel '${tunnel_name}' stopped."
+  else
+    echo "Tunnel '${tunnel_name}' is not running."
+    rm -f "$pidfile"
+  fi
+}
+
+cmd_status() {
+  local tunnel_name="${1:-$(default_tunnel_name)}"
+  local pidfile="/tmp/cloudflared-${tunnel_name}.pid"
+  local logfile="/tmp/cloudflared-${tunnel_name}.log"
+
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    echo "Tunnel '${tunnel_name}' is running (PID $(cat "$pidfile")), log: ${logfile}"
+  else
+    echo "Tunnel '${tunnel_name}' is not running."
+    rm -f "$pidfile"
+  fi
+}
+
+# ── Proxy commands (Traefik) ─────────────────────────────────
+
+proxy_compose() {
+  export DATA_DIR="$PROXY_DATA_DIR"
+  export DEV_PROXY_PORT=${DEV_PROXY_PORT:-8080}
+  docker compose -f "$PROXY_COMPOSE_FILE" "$@"
+}
+
+cmd_proxy() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    start)
+      echo "🚀 Starting Traefik proxy..."
+      proxy_compose up -d
+      echo "✅ Traefik proxy started on http://localhost:${DEV_PROXY_PORT:-8080}"
+      ;;
+    stop)
+      echo "🛑 Stopping Traefik proxy..."
+      proxy_compose down
+      echo "✅ Traefik proxy stopped"
+      ;;
+    restart)
+      cmd_proxy stop
+      cmd_proxy start
+      ;;
+    status)
+      proxy_compose ps
+      ;;
+    logs)
+      proxy_compose logs -f
+      ;;
+    help|--help|-h|"")
+      cat << EOF
+Usage: dev-tunnel proxy <command>
+
+Commands:
+  start     Start the Traefik proxy
+  stop      Stop the Traefik proxy
+  restart   Restart the Traefik proxy
+  status    Show proxy container status
+  logs      Follow proxy logs
+
+Environment variables:
+  DEV_PROXY_PORT   HTTP port (default: 8080)
+EOF
+      ;;
+    *)
+      echo "Unknown proxy command: $sub" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# ── Combined lifecycle ───────────────────────────────────────
+
+cmd_up() {
+  cmd_proxy start
+  cmd_start "$@"
+}
+
+cmd_down() {
+  cmd_stop "$@"
+  cmd_proxy stop
+}
+
+cmd_uninstall() {
+  echo "🗑️  Uninstalling dev-tunnel proxy..."
+  proxy_compose down 2>/dev/null || true
+  docker network rm devnet 2>/dev/null || true
+  rm -rf "$PROXY_DATA_DIR"
+  rm -f "$HOME/.local/bin/dev-tunnel"
+  echo "✅ Uninstalled. Cloudflare tunnels and 1Password items left intact."
+}
+
+cmd_help() {
+  cat << EOF
+Cloudflare Tunnel + Traefik proxy manager for dev environments
+
+Usage: dev-tunnel <command> [args]
+
+Tunnel:
+  setup <user> [project]   Create tunnel, DNS, SSL cert, save token to 1Password
+  start [tunnel-name]      Start tunnel (default: <dirname>-<whoami>)
+  stop  [tunnel-name]      Stop tunnel
+  status [tunnel-name]     Check if running
+
+Proxy:
+  proxy start|stop|restart|status|logs
+
+Combined:
+  up   [tunnel-name]       proxy start + tunnel start
+  down [tunnel-name]       tunnel stop + proxy stop
+
+Other:
+  uninstall                Remove proxy install (CF/1P untouched)
+  help                     Show this help
+
+Examples:
+  dev-tunnel setup tom                  # Setup teamology.tom.u2i.me + *.teamology.tom.u2i.me
+  dev-tunnel up                         # Start everything for current dir
+  dev-tunnel proxy logs                 # Tail Traefik logs
+EOF
+}
+
+# ── Main ─────────────────────────────────────────────────────
+
+case "${1:-help}" in
+  setup)     shift; cmd_setup "$@" ;;
+  start)     shift; cmd_start "$@" ;;
+  stop)      shift; cmd_stop "$@" ;;
+  status)    shift; cmd_status "$@" ;;
+  proxy)     shift; cmd_proxy "$@" ;;
+  up)        shift; cmd_up "$@" ;;
+  down)      shift; cmd_down "$@" ;;
+  uninstall) cmd_uninstall ;;
+  help|--help|-h) cmd_help ;;
+  *)         echo "Unknown command: $1"; cmd_help; exit 1 ;;
+esac

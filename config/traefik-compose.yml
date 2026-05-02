@@ -1,0 +1,17 @@
+services:
+  traefik:
+    image: traefik:v3
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entryPoints.web.address=:80
+    ports:
+      - "${DEV_PROXY_PORT-8080}:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [devnet]
+    restart: unless-stopped
+
+networks:
+  devnet:
+    external: true
