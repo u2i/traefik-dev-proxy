@@ -1,3 +1,1 @@
-reverse-proxy/certs/*.pem
-reverse-proxy/certs/*.key
 .DS_Store
